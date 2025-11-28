@@ -1,0 +1,9 @@
+name: elevator-sim-py
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - simpy>=4
+  - pygame>=2  # optional, only needed for GUI
+  - pip
