@@ -8,7 +8,8 @@ mode = 'simulate'  # 'animation' or 'simulate'
 
 sim_speed = 1.0  # simulation speed multiplier
 
-arrival_df_path = "high_dense_low_rise.csv"
+
+arrival_df_path = r"E:\iCloudDrive\master of applied computing\capstone project\new_arrival_simulator\low_dense_low_rise.csv"
 output_records_path = arrival_df_path.replace(".csv", "_simulation_records.csv")
 
 
