@@ -1,10 +1,18 @@
 import simpy
 import pandas as pd
+import numpy as np
 import pygame
 import time
 import tkinter as tk
+import torch
+import torch
+from torch import nn
+from torch.utils.data import Dataset, DataLoader
+from pytorch_tcn import TCN
 
-mode = 'simulate'  # 'animation' or 'simulate'
+mode = 'call_record'  # 'animation' or 'simulate' or 'call_record'
+reposition_mode = None  # 'tcn' or 'tsai' or 'none'
+num_floors=10
 
 sim_speed = 1.0  # simulation speed multiplier
 
@@ -12,13 +20,74 @@ sim_speed = 1.0  # simulation speed multiplier
 arrival_df_path = r"E:\iCloudDrive\master of applied computing\capstone project\new_arrival_simulator\low_dense_low_rise.csv"
 output_records_path = arrival_df_path.replace(".csv", "_simulation_records.csv")
 
+tcn_path = '../elevator-tcn/best_model/best_precision_modelmodel_training-v5_restart_focalloss_alpha_0.25_33.pth'
 
 num_elevators = 2
 capacity = 15
 travel_time_per_floor = 3
 load_time_per_person = 1
 
+class ElevatorTCNModel(nn.Module):
+    def __init__(self, input_channels, output_size, num_channels=[64, 64, 64], kernel_size=3, dropout=0.1):
+        super().__init__()
+        self.tcn = TCN(num_inputs=input_channels,
+                       num_channels=num_channels,
+                       kernel_size=kernel_size,
+                       dropout=dropout,
+                       causal=True)
+        self.linear = nn.Linear(num_channels[-1], output_size)
 
+    def forward(self, x):
+        # x shape: (batch_size, seq_len, input_channels)  
+        # 但 PyTorch-TCN 默认期望 (batch, channels, length),因此需要转置
+        x = x.transpose(1, 2)  # -> (batch, input_channels, seq_len)
+        y = self.tcn(x)        # -> (batch, num_channels[-1], seq_len)
+        # 取最后一个 time step’s feature map
+        out = self.linear(y[:, :, -1])  # -> (batch, output_size)
+        return out
+
+class ElevatorCallsDataset(Dataset):
+    def __init__(self, df, input_len=60*60, gap = 30 ,output_window=60,downsample_seconds = 60):
+        """
+        df: pandas DataFrame with time series data (按时间排序,频次例如每秒／每分钟)
+        input_len: 用多少时间步 (window length) 作为输入
+        gap: 输入和输出之间的时间间隔（例如30表示预测输入和输出之间有30个秒的间隔）
+        output_window: 预测多少步之后 (例如 60 表示预测下一分钟)
+        feature_cols: list of feature列名 (包含楼层 call & direction one-hot + optional 时间特征)
+        target_cols: list of target 列名 (未来是否有 call）
+        """
+        self.df = df.reset_index(drop=True)
+        self.data = self.df.values
+        self.input_len = input_len
+        self.gap = gap
+        self.output_window = output_window
+
+        self.downsample_seconds = downsample_seconds
+
+        self.total_length = len(self.data) - input_len - gap - output_window + 1
+        self.total_length = max(self.total_length, 0)
+            
+    
+    def __len__(self):
+        return self.total_length
+    
+    def __getitem__(self, idx):
+        input_window = self.data[idx:idx + self.input_len]
+    
+        x = []
+        for i in range(0, self.input_len, self.downsample_seconds):
+            block = input_window[i : i + self.downsample_seconds]
+            x.append(block.sum(axis=0))
+    
+        x = np.stack(x).astype(np.float32)
+    
+        output_window = self.data[
+            idx + self.input_len + self.gap - 1:
+            idx + self.input_len + self.gap + self.output_window - 1, 3:]
+        
+        y = (output_window.sum(axis=0) > 0).astype(np.float32)
+    
+        return torch.from_numpy(x), torch.from_numpy(y)
 
 class Passenger:
     def __init__(self, env, pid, arrival_time, origin, destination, egcs, arrival_ts=None):
@@ -172,7 +241,7 @@ class Elevator:
 # 电梯群控系统 (EGCS)
 # -----------------------------
 class EGCS:
-    def __init__(self, env, num_elevators=2, num_floors=10, idle_reposition=False):
+    def __init__(self, env, num_elevators=2, num_floors=10, idle_reposition=False,idle_reposition_coldown_duration=180):
         self.env = env
         self.elevators = [Elevator(env, self, i+1, capacity, travel_time_per_floor, load_time_per_person) for i in range(num_elevators)]
         self.num_floors = num_floors + 1
@@ -185,6 +254,29 @@ class EGCS:
         self.start_time = None
         self.idle_reposition = idle_reposition
         self.env.process(self.dispatcher())
+        self.baseline_wait_time = 15.19  # baseline without idle repositioning
+        self.awt = 0
+        self.reposition_count = 0
+        self.model_triggered_count = 0
+        
+        self.idle_time = 0
+        self.idle_reposition_wait = 10
+        
+        self.idle_reposition_coldown = 0
+        self.idle_reposition_coldown_duration = idle_reposition_coldown_duration
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        #import machine learning model for repositioning
+        if reposition_mode == 'tcn':
+            input_channels=num_floors*2+3
+            output_size=num_floors*2
+            self.model = ElevatorTCNModel(input_channels=input_channels, output_size=output_size)
+            self.model.load_state_dict(torch.load(tcn_path, map_location=self.device))
+            self.model.to(self.device)
+            self.model.eval()
+            
+        
 
     # def request_elevator(self, passenger):
     #     # 把乘客放入等待队列
@@ -265,7 +357,15 @@ class EGCS:
                                         elevator.direction = direction
                                         
             if vacancy and self.idle_reposition:
-                self.idle_repositioning()
+                if self.idle_time < self.idle_reposition_wait:
+                    self.idle_time += 1
+                else:
+                    self.idle_time = 0
+                    if self.idle_reposition_coldown > 0:
+                        self.idle_reposition_coldown -= 1
+                    else:
+                        self.idle_reposition_coldown = self.idle_reposition_coldown_duration
+                        self.idle_repositioning()
             
             # 每隔一定时间扫描一次
             yield self.env.timeout(1)  # 可以根据仿真需求改成 0.5 或 2 秒
@@ -274,19 +374,86 @@ class EGCS:
         direction = 1 if passenger.destination > passenger.origin else -1
         self.waiting[passenger.origin][direction].append(passenger)
         passenger.assigned = None
+        
+    def model_input(self):
+        max_time = self.start_time + pd.Timedelta(seconds=self.env.now)
+        min_time = max_time - pd.Timedelta(hours=1)
+        
+        columns = [ str(floor) + direction for floor in range(self.num_floors) for direction in ['_Up', '_Down']]
+        rows = pd.date_range(start=min_time, end=max_time, freq="S")
+        
+        call_record = pd.DataFrame(0, index=rows, columns = ['timestamp','day','time']+columns)
+        call_record['timestamp'] = call_record.index
+        call_record['day'] = call_record.index.weekday
+        call_record['time'] = call_record.index.hour * 3600 + call_record.index.minute * 60 + call_record.index.second
+        
+        
+        def preprocess_calls(row):
+            if row.isna().any():
+                return
+            time = row['Timestamp']
+            floor = row['Floor']
+            direction = 'Up' if row['Direction'] == 1 else 'Down'
+        
+            call_record.at[time, f"{floor}_{direction}"] = 1        
+        
+        call_records_df = pd.DataFrame(self.call_records)
+        # only record within last 1 hour
+        call_records_df = call_records_df[(call_records_df['Timestamp'] >= min_time) & (call_records_df['Timestamp'] <= max_time)]
+        call_records_df.apply(preprocess_calls, axis=1)
+        
+        call_record = call_record.drop(columns=['0_Down', f'{self.num_floors-1}_Up'])
+        call_record['timestamp'] = call_record['timestamp'].astype(np.int64) // 10**9
+        
+        input_window = call_record.values
+        x = []
+        for i in range(0, 60*60, 60):
+            block = input_window[i : i + 60]
+            x.append(block.sum(axis=0))
+    
+        x = np.stack(x).astype(np.float32)
+        return torch.from_numpy(x)
+        
 
     def idle_repositioning(self):
-        current_time = self.start_time + pd.Timedelta(seconds=self.env.now)
-        if current_time.hour >= 7 and current_time.hour < 10:
-            standby_floor = 0
+        if reposition_mode == 'tcn':
+            x = self.model_input().to(self.device)
+            self.model_triggered_count += 1
+            logits = self.model(x.unsqueeze(0))
+            logits = torch.clamp(logits, -20, 20)
+            preds = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy()
+            
+            if preds.sum() == 0:
+                return
+            
+            standby_indices = [i for i, v in enumerate(preds) if v >= 0.3]
+            standby_floors = set(i // 2 for i in standby_indices)
+            print(len(standby_floors))
+            
+        if reposition_mode == 'none':
+            current_time = self.start_time + pd.Timedelta(seconds=self.env.now)
+            if current_time.hour >= 7 and current_time.hour < 10:
+                standby_floors = [0]
+            else:
+                return
 
+        for standby_floor in standby_floors:
             idle_elevators = [e for e in self.elevators if e.direction == 0 and not e.requests]
             if idle_elevators:
-                avg_floor = sum(e.floor for e in self.elevators) / len(self.elevators)
                 for e in idle_elevators:
                     if e.floor != standby_floor:
                         e.requests.add(standby_floor)
+                        self.reposition_count += 1
                         e.direction = -1 if e.floor > standby_floor else 1
+                        
+                        
+    def average_wait_time(self):
+        if not self.records:
+            return 0
+        total_wait = sum(r['WaitTime'] for r in self.records)
+        awt =  total_wait / len(self.records)
+        self.awt = awt
+        return awt
 
 # -----------------------------
 # 主函数
@@ -296,11 +463,11 @@ def setup_simulation(csv_path, buffer_time=1000):
 
 
     # Read CSV and normalize/parse timestamps
-    origin_df = pd.read_csv(csv_path)
-    index = int(len(origin_df)*0.8)
-    while origin_df["time_second"].iloc[index] > 370*60:
-        index -= 1
-        df = origin_df.iloc[index:]
+    df = pd.read_csv(csv_path)
+    if mode != 'call_record':
+        index = len(df) * 0.8
+        df = df.iloc[int(index):]
+    
     
     if 'timestamp' in df.columns:
         df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
@@ -311,12 +478,11 @@ def setup_simulation(csv_path, buffer_time=1000):
     else:
         start_ts = None
 
-    num_floors = df[['origin', 'destination']].max().max()
+    # num_floors = df[['origin', 'destination']].max().max()
 
     egcs = EGCS(env, num_elevators=num_elevators, num_floors=num_floors)
     # Store a wall-clock start time on EGCS for converting sim times to timestamps
-    egcs.start_time = start_ts
-    
+    egcs.start_time = start_ts    
 
     for idx, row in df.iterrows():
         if start_ts is not None and pd.notna(row['timestamp']):
@@ -339,13 +505,23 @@ def setup_simulation(csv_path, buffer_time=1000):
 
 def simulate_loop():
     env, egcs, min_timestamp, sim_time = setup_simulation(arrival_df_path, buffer_time=600)
-    env.run(until=sim_time)
-    records_df = pd.DataFrame(egcs.records)
-    records_df.to_csv(output_records_path, index=False)
+    if reposition_mode:
+        egcs.idle_reposition = True
+    env.run(until=sim_time)    
+    # Save records to CSV
+    if mode == 'simulate':
+        records_df = pd.DataFrame(egcs.records)
+        records_df.to_csv(output_records_path, index=False)
+        awt = egcs.average_wait_time()
+        print(f'Prediction model triggered count: {egcs.model_triggered_count}')
+        print(f"Reposition count: {egcs.reposition_count}")
+        print(f"Simulation complete. Average Wait Time: {awt}s")
+        return awt
     
-    call_records_df = pd.DataFrame(egcs.call_records)
-    call_records_path = output_records_path.replace('.csv', '_calls.csv')
-    call_records_df.to_csv(call_records_path, index=False)
+    if mode == 'call_record':
+        call_records_df = pd.DataFrame(egcs.call_records)
+        call_records_path = output_records_path.replace('.csv', '_calls.csv')
+        call_records_df.to_csv(call_records_path, index=False)
 
 
 
@@ -360,7 +536,7 @@ elevators = []
 # =========================================================
 import pygame, time
 
-def animation_loop():
+def animation_loop(awt):
     global egcs_instance, env_instance, simulation_running, status_text, elevators
     
     pygame.init()
@@ -502,10 +678,11 @@ def animation_loop():
 
 
     # ==== 主循环 ====
-    def main_loop():
+    def main_loop(awt):
         global egcs_instance, env_instance, simulation_running, status_text, elevators, sim_speed
         env_instance, egcs_instance, min_timestamp, _ = setup_simulation(arrival_df_path, buffer_time=600)
         draw_ui(progress='init',min_time=min_timestamp)
+        egcs_instance.baseline_wait_time = awt
         running = True
         while running:
             for event in pygame.event.get():
@@ -549,13 +726,14 @@ def animation_loop():
 
         pygame.quit()
     
-    main_loop()
+    main_loop(awt)
 
 
 if __name__ == "__main__":
-    if mode == 'animation':
-        animation_loop()
-    elif mode == 'simulate':
+    if mode == 'animation' :
+        awt = simulate_loop()
+        animation_loop(awt)
+    elif mode == 'simulate' or mode == 'call_record':
         simulate_loop()
 
 
