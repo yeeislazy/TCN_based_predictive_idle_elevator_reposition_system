@@ -657,24 +657,43 @@ def animation_loop(awt):
         screen.blit(font.render(f"[1] 0.5x [2] 1x    [3] 5x", True, (0, 0, 0)), (WIDTH*0.65-15, 140))
         screen.blit(font.render(f"[4] 10x  [5] 50x [6] 100x", True, (0, 0, 0)), (WIDTH*0.65-15, 170))
         
-        # average waiting time
-        awt = 0
-        if egcs_instance and egcs_instance.records:
-            awt = sum(r['WaitTime'] for r in egcs_instance.records) / len(egcs_instance.records)
-        screen.blit(font.render(f"Avg Wait Time: {awt:.2f}s", True, (0, 0, 0)), (WIDTH*0.65-15, 230))
-        
         # total completed passengers
         tcp = 0
         if egcs_instance and egcs_instance.records:
             tcp = len(egcs_instance.records)
-        screen.blit(font.render(f"Completed Passengers: {tcp}", True, (0, 0, 0)), (WIDTH*0.65-15, 260))
+        screen.blit(font.render(f"Completed Passengers: {tcp}", True, (0, 0, 0)), (WIDTH*0.65-15, 230))
         
         # average passenger per day
         apd = 0
         if egcs_instance and egcs_instance.records and min_time:
             days_passed = (min_time + pd.Timedelta(seconds=env_instance.now) - min_time).days + 1
             apd = tcp / days_passed
-        screen.blit(font.render(f"Avg Passengers/Day: {apd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-15, 290))
+        screen.blit(font.render(f"Avg Passengers/Day: {apd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-15, 260))
+        
+        # baseline average waiting time
+        bawt = 15.19
+        screen.blit(font.render(f"Baseline AWT: {bawt:.2f}s", True, (0, 0, 0)), (WIDTH*0.65-15, 300))
+        
+        
+        # average waiting time
+        awt = 0
+        if egcs_instance and egcs_instance.records:
+            awt = egcs_instance.average_wait_time()
+        screen.blit(font.render(f"Current AWT: {awt:.2f}s", True, (0, 0, 0)), (WIDTH*0.65-15, 330))
+
+        
+        # reposition count
+        rc = 0
+        if egcs_instance:
+            rc = egcs_instance.reposition_count
+        screen.blit(font.render(f"Reposition Count: {rc}", True, (0, 0, 0)), (WIDTH*0.65-15, 370))
+        
+        # reposition count per day
+        rcpd = 0
+        if egcs_instance and min_time:
+            days_passed = (min_time + pd.Timedelta(seconds=env_instance.now) - min_time).days + 1
+            rcpd = rc / days_passed
+        screen.blit(font.render(f"Reposition Count/Day: {rcpd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-15, 400))
 
 
     # ==== 主循环 ====
