@@ -10,7 +10,7 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from pytorch_tcn import TCN
 
-mode = 'call_record'  # 'animation' or 'simulate' or 'call_record'
+mode = 'animation'  # 'animation' or 'simulate' or 'call_record'
 reposition_mode = None  # 'tcn' or 'tsai' or 'none'
 num_floors=10
 
@@ -630,7 +630,7 @@ def animation_loop(awt):
                 clock_text = current_time.strftime('%Y-%m-%d %H:%M:%S')
                 day = current_time.weekday()
 
-        # 绘制 Start 按钮与状态
+        # draw control buttons and info
         if simulation_running:
             button_color = (200, 100, 100)
             button_text = "Pause"
