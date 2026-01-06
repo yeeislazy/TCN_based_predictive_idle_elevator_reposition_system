@@ -9,15 +9,17 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from pytorch_tcn import TCN
+import os
 
-mode = 'animation'  # 'animation' or 'simulate' or 'call_record'
+mode = 'call_record'  # 'animation' or 'simulate' or 'call_record'
 reposition_mode = None  # 'tcn' or 'tsai' or 'none'
-num_floors=10
+num_floors=20
 
 sim_speed = 1.0  # simulation speed multiplier
 
-
-arrival_df_path = r"E:\iCloudDrive\master of applied computing\capstone project\new_arrival_simulator\low_dense_low_rise.csv"
+current_dir = os.getcwd()
+parent_dir = os.path.dirname(current_dir)
+arrival_df_path = os.path.join(parent_dir, 'new_arrival_simulator', 'data', 'low_dense_low_rise.csv')
 output_records_path = arrival_df_path.replace(".csv", "_simulation_records.csv")
 
 tcn_path = '../elevator-tcn/best_model/best_precision_modelmodel_training-v5_restart_focalloss_alpha_0.25_33.pth'
@@ -356,7 +358,7 @@ class EGCS:
                                 if elevator.direction == 0:
                                         elevator.direction = direction
                                         
-            if vacancy and self.idle_reposition:
+            if vacancy and self.idle_reposition and mode != 'call_record':
                 if self.idle_time < self.idle_reposition_wait:
                     self.idle_time += 1
                 else:
@@ -503,7 +505,7 @@ def setup_simulation(csv_path, buffer_time=1000):
 
     return env, egcs, min_timestamp, sim_time
 
-def simulate_loop():
+def simulate_loop(arrival_df_path):
     env, egcs, min_timestamp, sim_time = setup_simulation(arrival_df_path, buffer_time=600)
     if reposition_mode:
         egcs.idle_reposition = True
@@ -520,7 +522,7 @@ def simulate_loop():
     
     if mode == 'call_record':
         call_records_df = pd.DataFrame(egcs.call_records)
-        call_records_path = output_records_path.replace('.csv', '_calls.csv')
+        call_records_path = arrival_df_path.replace(".csv", "_call_records.csv")
         call_records_df.to_csv(call_records_path, index=False)
 
 
@@ -536,7 +538,7 @@ elevators = []
 # =========================================================
 import pygame, time
 
-def animation_loop(awt):
+def animation_loop(awt,arrival_df_path):
     global egcs_instance, env_instance, simulation_running, status_text, elevators
     
     pygame.init()
@@ -697,7 +699,7 @@ def animation_loop(awt):
 
 
     # ==== 主循环 ====
-    def main_loop(awt):
+    def main_loop(awt,arrival_df_path):
         global egcs_instance, env_instance, simulation_running, status_text, elevators, sim_speed
         env_instance, egcs_instance, min_timestamp, _ = setup_simulation(arrival_df_path, buffer_time=600)
         draw_ui(progress='init',min_time=min_timestamp)
@@ -745,14 +747,19 @@ def animation_loop(awt):
 
         pygame.quit()
     
-    main_loop(awt)
+    main_loop(awt,arrival_df_path)
 
 
 if __name__ == "__main__":
     if mode == 'animation' :
-        awt = simulate_loop()
-        animation_loop(awt)
-    elif mode == 'simulate' or mode == 'call_record':
-        simulate_loop()
+        awt = simulate_loop(arrival_df_path)
+        animation_loop(awt,arrival_df_path)
+    elif mode == 'simulate' :
+        simulate_loop(arrival_df_path)
+    elif mode == 'call_record' :    
+        for file in ["low_dense_low_rise.csv", "low_dense_high_rise.csv", "high_dense_low_rise.csv", "high_dense_high_rise.csv"]:
+            arrival_df_path = os.path.join(parent_dir, "new_arrival_simulator", "data", file)
+            simulate_loop(arrival_df_path)
+
 
 
