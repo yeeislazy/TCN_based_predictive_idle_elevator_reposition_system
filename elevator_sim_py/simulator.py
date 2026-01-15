@@ -5,24 +5,35 @@ import pygame
 import time
 import tkinter as tk
 import torch
-import torch
-from torch import nn
+from torch import nn, threshold
 from torch.utils.data import Dataset, DataLoader
 from pytorch_tcn import TCN
 import os
+import joblib
 
-mode = 'call_record'  # 'animation' or 'simulate' or 'call_record'
-reposition_mode = None  # 'tcn' or 'tsai' or 'none'
-num_floors=20
+mode = 'animation'  # 'animation' or 'simulate' or 'call_record'
+reposition_mode = 'tcn'  # 'tcn' or 'tsai' or 'none'
+
+profile = 'low_dense_low_rise'  # 'low_dense_low_rise', 'high_dense_low_rise', 'low_dense_high_rise', 'high_dense_high_rise'
+num_floors=10
 
 sim_speed = 1.0  # simulation speed multiplier
 
-current_dir = os.getcwd()
+current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
-arrival_df_path = os.path.join(parent_dir, 'new_arrival_simulator', 'data', 'low_dense_low_rise.csv')
-output_records_path = arrival_df_path.replace(".csv", "_simulation_records.csv")
+arrival_df_path = os.path.join(parent_dir, 'arrival_simulator', 'data', f'{profile}.csv')
+output_dir = os.path.join(current_dir, 'simulation_records')
+os.makedirs(output_dir, exist_ok=True)
 
-tcn_path = '../elevator-tcn/best_model/best_precision_modelmodel_training-v5_restart_focalloss_alpha_0.25_33.pth'
+
+tcn_type = 'best_precision'  # 'balance', 'best_precision', 'best_recall'
+tcn_path = os.path.join(parent_dir, profile, 'best_model', f'{tcn_type}.pth')
+scaler_path = os.path.join(parent_dir, profile, 'scaler')
+
+if reposition_mode.startswith('tcn'):
+    output_records_name = f'{profile}_reposition_{reposition_mode}_{tcn_type}.csv'
+elif reposition_mode == 'none':
+    output_records_name = f'{profile}_reposition_{reposition_mode}.csv'
 
 num_elevators = 2
 capacity = 15
@@ -41,23 +52,15 @@ class ElevatorTCNModel(nn.Module):
 
     def forward(self, x):
         # x shape: (batch_size, seq_len, input_channels)  
-        # 但 PyTorch-TCN 默认期望 (batch, channels, length),因此需要转置
+        # but PyTorch-TCN expects (batch, channels, length), so we need to transpose
         x = x.transpose(1, 2)  # -> (batch, input_channels, seq_len)
         y = self.tcn(x)        # -> (batch, num_channels[-1], seq_len)
-        # 取最后一个 time step’s feature map
+        # take the last time step’s feature map
         out = self.linear(y[:, :, -1])  # -> (batch, output_size)
         return out
 
 class ElevatorCallsDataset(Dataset):
     def __init__(self, df, input_len=60*60, gap = 30 ,output_window=60,downsample_seconds = 60):
-        """
-        df: pandas DataFrame with time series data (按时间排序,频次例如每秒／每分钟)
-        input_len: 用多少时间步 (window length) 作为输入
-        gap: 输入和输出之间的时间间隔（例如30表示预测输入和输出之间有30个秒的间隔）
-        output_window: 预测多少步之后 (例如 60 表示预测下一分钟)
-        feature_cols: list of feature列名 (包含楼层 call & direction one-hot + optional 时间特征)
-        target_cols: list of target 列名 (未来是否有 call）
-        """
         self.df = df.reset_index(drop=True)
         self.data = self.df.values
         self.input_len = input_len
@@ -119,7 +122,7 @@ class Passenger:
         self.egcs.add_to_waiting(self)
 
 # -----------------------------
-# 电梯类
+# Elevator class
 # -----------------------------
 class Elevator:
     def __init__(self, env, egcs, eid, capacity=15, travel_time=3, load_time_per_person=1):
@@ -132,16 +135,30 @@ class Elevator:
         self.destination = None
         self.direction = 0  # 1 = up, -1 = down, 0 = idle
         self.moving = 0
-        self.requests = set()
+        self.requests = {}  # floors to visit: key=floor, value='pickup'/'dropoff'/'idle_reposition'
         self.travel_time = travel_time
         self.load_time_per_person = load_time_per_person
         self.action = env.process(self.run())
 
-    def move_to(self, floor):
-        # 移动楼层
+
+    def move_to(self, floor,move_type='pickup'):
+        # move elevator to specified floor
         self.destination = floor
+        original_floor = self.floor
+        start_time = self.egcs.start_time + pd.Timedelta(seconds=self.env.now) if self.egcs.start_time is not None else self.env.now
         self.moving = 1 if floor > self.floor else -1 if floor < self.floor else 0
         step = 1 / self.travel_time
+        distance = abs(floor - original_floor)
+        
+        self.egcs.movement_log.append({
+            "ElevatorID": self.eid,
+            "FromFloor": original_floor,
+            "ToFloor": floor,
+            "StartTimestamp": start_time,
+            "EndTimestamp": None,
+            "MoveType": move_type,
+            "Distance": None
+        })
 
         while abs(self.floor - floor) > step / 2:
             yield self.env.timeout(1)
@@ -151,10 +168,20 @@ class Elevator:
                 self.floor = floor
         
         self.floor = floor
+        end_time = self.egcs.start_time + pd.Timedelta(seconds=self.env.now) if self.egcs.start_time is not None else self.env.now
+        self.egcs.movement_log.append({
+            "ElevatorID": self.eid,
+            "FromFloor": original_floor,
+            "ToFloor": floor,
+            "StartTimestamp": start_time,
+            "EndTimestamp": end_time,
+            "MoveType": move_type,
+            "Distance": distance
+        })
         self.moving = 0
 
     def board_passengers(self, waiting_passengers):
-        # 上客（考虑容量）
+        # board passengers from the waiting queue
         available_space = self.capacity - len(self.passengers)
         if available_space <= 0:
             return []
@@ -175,28 +202,36 @@ class Elevator:
 
     def run(self):
         while True:
-            # 1️⃣ 没有任务则等 1s
+            # idle if no requests
             if not self.requests:
                 self.moving = False
                 yield self.env.timeout(1)
                 continue
-
-            # 2️⃣ 取下一个任务楼层
+            
+            # select next floor to visit
+            # request format: (floor, request_type) , select the lowest floor request
             if self.direction == 1:
-                next_floor = min(self.requests)
+                next_floor = min(self.requests.keys())
+                
+            elif self.direction == -1:
+                next_floor = max(self.requests.keys())
             else:
-                next_floor = max(self.requests)
+                # idle, pick the nearest request
+                next_floor = min(self.requests.keys(), key=lambda f: abs(f - self.floor))
+                self.direction = 1 if next_floor > self.floor else -1 if next_floor < self.floor else 0
+            
+            request_type = self.requests[next_floor]
 
             # move to next floor
-            yield from self.move_to(next_floor)
+            yield from self.move_to(next_floor,request_type)
 
             self.moving = False
             disembarked = [p for p in self.passengers if p.destination == next_floor]
             for p in disembarked:
                 yield self.env.timeout(self.load_time_per_person)
-                p.total_time = self.env.now - p.wait_start  # 统计总耗时
+                p.total_time = self.env.now - p.wait_start  # total time
                 self.passengers.remove(p)
-                self.egcs.records.append({
+                self.egcs.passengers_records.append({
                     "PassengerID": p.id,
                     "Origin": p.origin,
                     "Destination": p.destination,
@@ -207,14 +242,6 @@ class Elevator:
                     "TotalTime": p.total_time
                 })
 
-
-            # 3️⃣ 上客
-            # if self.requests:
-            #     # 如果电梯空闲，决定当前方向
-            #     next_floor = min(self.requests, key=best_key)
-            #     self.direction = 1 if next_floor > self.floor else -1
-            # else:
-            #     self.direction = 0
 
             waiting = self.egcs.waiting[next_floor][self.direction]
             if waiting:
@@ -228,28 +255,29 @@ class Elevator:
                 self.egcs.floor_reserved[next_floor][self.direction] = None
                 
                 if next_floor in self.requests:
-                    self.requests.discard(next_floor)
+                    self.requests.pop(next_floor)
                 
-                # 4️⃣ 送乘客到目的地
+                # set passenger to dropoff destination
                 for p in boarded:
-                    if p.destination not in self.requests:
-                        self.requests.add(p.destination)
+                    if p.destination not in self.requests.keys() or self.requests[p.destination] == 'idle_reposition':
+                        self.requests[p.destination] = 'dropoff'
             else:
-                self.requests.discard(next_floor)
+                self.requests.pop(next_floor)
             
             if not self.requests:
                 self.direction = 0
 # -----------------------------
-# 电梯群控系统 (EGCS)
+# Elevator Group Control System (EGCS)
 # -----------------------------
 class EGCS:
     def __init__(self, env, num_elevators=2, num_floors=10, idle_reposition=False,idle_reposition_coldown_duration=180):
         self.env = env
         self.elevators = [Elevator(env, self, i+1, capacity, travel_time_per_floor, load_time_per_person) for i in range(num_elevators)]
         self.num_floors = num_floors + 1
-        self.waiting = {i: {1:[], -1:[]} for i in range(self.num_floors)}  # 每层的等待队列
-        self.floor_reserved = {i: {1: None, -1: None} for i in range(self.num_floors)}  # 每层的预留电梯
-        self.records = []
+        self.waiting = {i: {1:[], -1:[]} for i in range(self.num_floors)}  # waiting queues on each floor
+        self.floor_reserved = {i: {1: None, -1: None} for i in range(self.num_floors)}  # reserved elevators on each floor
+        self.passengers_records = []
+        self.movement_log = []
         self.call_records = []
         # start_time will be a pandas.Timestamp representing the wall-clock time
         # corresponding to simulation time 0. Set by run_simulation after reading CSV.
@@ -262,7 +290,7 @@ class EGCS:
         self.model_triggered_count = 0
         
         self.idle_time = 0
-        self.idle_reposition_wait = 10
+        self.idle_reposition_wait = 3
         
         self.idle_reposition_coldown = 0
         self.idle_reposition_coldown_duration = idle_reposition_coldown_duration
@@ -270,48 +298,35 @@ class EGCS:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
         #import machine learning model for repositioning
-        if reposition_mode == 'tcn':
+        if reposition_mode.startswith('tcn'):
             input_channels=num_floors*2+3
             output_size=num_floors*2
             self.model = ElevatorTCNModel(input_channels=input_channels, output_size=output_size)
+            
             self.model.load_state_dict(torch.load(tcn_path, map_location=self.device))
             self.model.to(self.device)
             self.model.eval()
+
+            self.tcn_threshold = 0.5
             
-        
-
-    # def request_elevator(self, passenger):
-    #     # 把乘客放入等待队列
-    #     if passenger.destination > passenger.origin:
-    #         self.waiting[passenger.origin][1].append(passenger)  # 上行队列
-    #     else:
-    #         self.waiting[passenger.origin][-1].append(passenger)  # 下行队列
-    #     # 分配电梯（返回 Elevator 实例或 None）
-    #     elevator = self.assign_elevator(passenger)
-    #     if elevator:
-    #         # 把乘客所在楼层加入该电梯的 requests（pickup）
-    #         elevator.requests.add(passenger.origin)
-    #         # 如果电梯空闲，设置方向预期（便于 assign 以后仍然匹配）
-    #         if elevator.direction == 0:
-    #             elevator.direction = 1 if passenger.destination > passenger.origin else -1
-    #         # debug
-    #         # print(f"[t={self.env.now}] Assigned elevator {elevator.eid} to pickup at {passenger.origin} for pid {passenger.id}")
-    #     else:
-    #         # no elevator currently assignable -> it stays in waiting; later idle elevator will scan waiting
-    #         # print(f"[t={self.env.now}] No elevator assigned yet for pickup at {passenger.origin} pid {passenger.id}")
-    #         pass
-
+            # import pkl scaler
+            self.scaler_day = joblib.load(os.path.join(scaler_path, 'scaler_day.pkl'))
+            self.scaler_time = joblib.load(os.path.join(scaler_path, 'scaler_time.pkl'))
+            self.scaler_timestamp = joblib.load(os.path.join(scaler_path, 'scaler_timestamp.pkl'))
+            
+        elif reposition_mode == 'tsai':
+            # Tsai reposition parameters
+            self.tsai_window = 3600        # W = 1 hour
+            self.tsai_lambda = 1.0         # λ
+            self.tsai_sigma = 2.5          # σ
+            self.tsai_weight = 0.6         # w
 
     def assign_elevator(self, direction, origin):
-        # origin = passenger.origin
-        # direction = 1 if passenger.destination > origin else -1
-
-        # prefer elevators already moving in that direction, and not full
         candidates = []
         for e in self.elevators:
             if e.direction in (0, direction) and len(e.passengers) < e.capacity:
                 if e.moving == 1 and e.floor > origin:
-                    continue  # 向上但已超过该楼层
+                    continue  # moving up but already passed the floor
                 if e.moving == -1 and e.floor < origin:
                     continue
                 candidates.append(e)
@@ -321,7 +336,7 @@ class EGCS:
             e.direction = direction
             return e
 
-        # ② 否则选择最近的空闲电梯
+        # Otherwise choose the nearest idle elevator
         idle = [e for e in self.elevators if e.direction == 0]
         if idle:
             e = min(idle, key=lambda e: abs(e.floor - origin))
@@ -331,7 +346,7 @@ class EGCS:
     
     def dispatcher(self):
         while True:
-            # 遍历每层楼的等待队列
+            # Iterate over waiting queues on each floor
             vacancy = True
             for floor, queues in self.waiting.items():
                 for direction in [1, -1]:
@@ -350,11 +365,11 @@ class EGCS:
                         elevator = self.assign_elevator(direction, floor)
                         if elevator:
                             self.floor_reserved[floor][direction] = elevator
-                            elevator.requests.add(floor)
+                            elevator.requests[floor] = 'pickup'
                             unassigned = [p for p in waiting_list if not p.assigned]
                             for passenger in unassigned:
-                                passenger.assigned = elevator  # 标记已分配
-                                # 如果电梯空闲，设方向
+                                passenger.assigned = elevator  # mark as assigned
+                                # if elevator is idle, set direction
                                 if elevator.direction == 0:
                                         elevator.direction = direction
                                         
@@ -369,8 +384,8 @@ class EGCS:
                         self.idle_reposition_coldown = self.idle_reposition_coldown_duration
                         self.idle_repositioning()
             
-            # 每隔一定时间扫描一次
-            yield self.env.timeout(1)  # 可以根据仿真需求改成 0.5 或 2 秒
+            # Scan at regular intervals
+            yield self.env.timeout(1)
             
     def add_to_waiting(self, passenger):
         direction = 1 if passenger.destination > passenger.origin else -1
@@ -382,12 +397,18 @@ class EGCS:
         min_time = max_time - pd.Timedelta(hours=1)
         
         columns = [ str(floor) + direction for floor in range(self.num_floors) for direction in ['_Up', '_Down']]
-        rows = pd.date_range(start=min_time, end=max_time, freq="S")
+        rows = pd.date_range(start=min_time, end=max_time, freq="s")
         
         call_record = pd.DataFrame(0, index=rows, columns = ['timestamp','day','time']+columns)
         call_record['timestamp'] = call_record.index
         call_record['day'] = call_record.index.weekday
         call_record['time'] = call_record.index.hour * 3600 + call_record.index.minute * 60 + call_record.index.second
+        
+        # scale day, time and timestamp
+        call_record['day'] = self.scaler_day.transform(call_record[['day']])
+        call_record['time'] = self.scaler_time.transform(call_record[['time']])
+        call_record['timestamp'] = call_record['timestamp'].astype(np.int64) // 10
+        call_record['timestamp'] = self.scaler_timestamp.transform(call_record[['timestamp']])
         
         
         def preprocess_calls(row):
@@ -400,12 +421,13 @@ class EGCS:
             call_record.at[time, f"{floor}_{direction}"] = 1        
         
         call_records_df = pd.DataFrame(self.call_records)
+        
+        
         # only record within last 1 hour
         call_records_df = call_records_df[(call_records_df['Timestamp'] >= min_time) & (call_records_df['Timestamp'] <= max_time)]
         call_records_df.apply(preprocess_calls, axis=1)
         
         call_record = call_record.drop(columns=['0_Down', f'{self.num_floors-1}_Up'])
-        call_record['timestamp'] = call_record['timestamp'].astype(np.int64) // 10**9
         
         input_window = call_record.values
         x = []
@@ -416,49 +438,103 @@ class EGCS:
         x = np.stack(x).astype(np.float32)
         return torch.from_numpy(x)
         
+    def compute_score_wait(self, current_time):
+        score_wait = np.zeros(self.num_floors)
 
+        for rec in self.call_records:
+            floor = rec["Floor"]
+            call_time = rec["Timestamp"]
+
+            delta_t = (current_time - call_time).total_seconds()
+            if delta_t < 0 or delta_t > self.tsai_lambda * self.tsai_window:
+                continue
+
+            phi = max(0.0, 1.0 - delta_t / (self.tsai_lambda * self.tsai_window))
+            score_wait[floor] += phi
+
+        return score_wait
+
+    def compute_score_energy(self, elevator_floor):
+        floors = np.arange(self.num_floors)
+        sigma = self.tsai_sigma
+        return np.exp(-((floors - elevator_floor) ** 2) / (2 * sigma ** 2))
+
+    def tsai_idle_repositioning(self):
+        current_time = self.start_time + pd.Timedelta(seconds=self.env.now)
+
+        score_wait = self.compute_score_wait(current_time)
+
+        for e in self.elevators:
+            if e.direction != 0 or e.requests:
+                continue  # only idle elevators
+
+            score_energy = self.compute_score_energy(e.floor)
+
+            score_combined = (
+                self.tsai_weight * score_wait +
+                (1 - self.tsai_weight) * score_energy
+            )
+
+            standby_floor = int(np.argmax(score_combined))
+
+            if standby_floor != e.floor:
+                e.requests[standby_floor] = 'idle_reposition'
+                e.direction = 1 if standby_floor > e.floor else -1
+                self.reposition_count += 1
+
+    
     def idle_repositioning(self):
-        if reposition_mode == 'tcn':
+        if reposition_mode.startswith('tcn'):
             x = self.model_input().to(self.device)
             self.model_triggered_count += 1
             logits = self.model(x.unsqueeze(0))
             logits = torch.clamp(logits, -20, 20)
             preds = torch.sigmoid(logits).squeeze(0).detach().cpu().numpy()
             
-            if preds.sum() == 0:
-                return
-            
-            standby_indices = [i for i, v in enumerate(preds) if v >= 0.3]
-            standby_floors = set(i // 2 for i in standby_indices)
-            print(len(standby_floors))
-            
-        if reposition_mode == 'none':
-            current_time = self.start_time + pd.Timedelta(seconds=self.env.now)
-            if current_time.hour >= 7 and current_time.hour < 10:
-                standby_floors = [0]
-            else:
-                return
+            pos = preds >= self.tcn_threshold
+            standby_floors = pos.reshape(-1,2).any(axis=1).nonzero()[0].tolist()
+            floor_scores = preds.reshape(-1,2).max(axis=1)
+            if not standby_floors and floor_scores.max() >= 0.2:
+                K = 1
+                standby_floors = np.argsort(-floor_scores)[:K].tolist()
+                        
+        elif reposition_mode == 'tsai':
+            self.tsai_idle_repositioning()
+            return
+         
+        elif reposition_mode == 'none':
+            return
 
         for standby_floor in standby_floors:
             idle_elevators = [e for e in self.elevators if e.direction == 0 and not e.requests]
             if idle_elevators:
                 for e in idle_elevators:
                     if e.floor != standby_floor:
-                        e.requests.add(standby_floor)
+                        e.requests[standby_floor] = 'idle_reposition'
                         self.reposition_count += 1
                         e.direction = -1 if e.floor > standby_floor else 1
                         
                         
     def average_wait_time(self):
-        if not self.records:
+        if not self.passengers_records:
             return 0
-        total_wait = sum(r['WaitTime'] for r in self.records)
-        awt =  total_wait / len(self.records)
+        total_wait = sum(r['WaitTime'] for r in self.passengers_records)
+        awt =  total_wait / len(self.passengers_records)
         self.awt = awt
         return awt
 
+    def movement_count(self):
+        if not self.movement_log:
+            return 0,0
+        movement_log_df = pd.DataFrame(self.movement_log)
+        movement_log_df = movement_log_df.dropna()
+        movement_log_df = movement_log_df.drop_duplicates()
+        total_movements_distance = movement_log_df['Distance'].sum()
+        reposistion_movements_distance = movement_log_df[movement_log_df['MoveType']=='idle_reposition']['Distance'].sum()
+
+        return reposistion_movements_distance, total_movements_distance
 # -----------------------------
-# 主函数
+# Simulation setup function
 # -----------------------------
 def setup_simulation(csv_path, buffer_time=1000):
     env = simpy.Environment()
@@ -505,15 +581,22 @@ def setup_simulation(csv_path, buffer_time=1000):
 
     return env, egcs, min_timestamp, sim_time
 
-def simulate_loop(arrival_df_path):
+def simulate_loop(arrival_df_path,output_dir,output_records_name):
     env, egcs, min_timestamp, sim_time = setup_simulation(arrival_df_path, buffer_time=600)
-    if reposition_mode:
+    if reposition_mode != 'none':
         egcs.idle_reposition = True
     env.run(until=sim_time)    
     # Save records to CSV
     if mode == 'simulate':
-        records_df = pd.DataFrame(egcs.records)
-        records_df.to_csv(output_records_path, index=False)
+        passenger_records_dir = os.path.join(output_dir,'passenger_records')
+        movement_log_dir = os.path.join(output_dir, 'movement_logs')
+        os.makedirs(passenger_records_dir, exist_ok=True)
+        os.makedirs(movement_log_dir, exist_ok=True)
+        
+        records_df = pd.DataFrame(egcs.passengers_records)
+        records_df.to_csv(os.path.join(passenger_records_dir, output_records_name), index=False)
+        movement_df = pd.DataFrame(egcs.movement_log)
+        movement_df.to_csv(os.path.join(movement_log_dir, output_records_name), index=False)
         awt = egcs.average_wait_time()
         print(f'Prediction model triggered count: {egcs.model_triggered_count}')
         print(f"Reposition count: {egcs.reposition_count}")
@@ -534,7 +617,7 @@ status_text = "Idle"
 elevators = []
 
 # =========================================================
-# PyGame 实时动画显示
+# PyGame Realtime Animation Display
 # =========================================================
 import pygame, time
 
@@ -549,7 +632,7 @@ def animation_loop(awt,arrival_df_path):
     font = pygame.font.Font(None, 28)
     clock = pygame.time.Clock()
 
-    # ==== 模拟参数 ====
+    # ==== Simulation Parameters ====
     params = {
         "arrival_df_path": "low_dense_low_rise.csv",
         "num_elevators": "2",
@@ -559,7 +642,7 @@ def animation_loop(awt,arrival_df_path):
         "num_floors": "10",
     }
 
-    # ==== 电梯动画类 ====
+    # ==== Elevator Animation ====
     class ElevatorAnimation:
         def __init__(self,index, base_y, passenger_count=0, floor_height=50):
             self.index = index
@@ -588,7 +671,7 @@ def animation_loop(awt,arrival_df_path):
             screen.blit(self.image, self.rect)
 
 
-    # ==== UI 绘制函数 ====
+    # ==== UI Drawing Function ====
     def draw_ui(progress='update',simulation_running = False, min_time = None):
         global status_text
         screen.fill((245, 245, 245))
@@ -596,7 +679,7 @@ def animation_loop(awt,arrival_df_path):
         floor_height = (base_y - 10) // (int(egcs_instance.num_floors) if egcs_instance else int(params["num_floors"]) + 1)
         y_elevator = []
 
-        # 绘制楼层
+        # Draw floors
         if egcs_instance:
             for i in range(egcs_instance.num_floors):
                 y = base_y - i * floor_height         
@@ -610,7 +693,7 @@ def animation_loop(awt,arrival_df_path):
                 num_waiting_text = font.render(str(num_waiting), True, (0, 0, 0))
                 screen.blit(num_waiting_text, (410, y - 30))
 
-        # 初始化电梯动画
+        # Initialize elevator animation
         if progress == 'init':
             elevators.clear()
             for i, e in enumerate(egcs_instance.elevators):
@@ -620,7 +703,7 @@ def animation_loop(awt,arrival_df_path):
                 day = min_time.weekday()
                 status_text = "Paused"
 
-        # 更新电梯动画
+        # Update elevator animation
         elif progress == 'update':
             for i, e in enumerate(egcs_instance.elevators):
                 elevators[i].update()
@@ -632,7 +715,7 @@ def animation_loop(awt,arrival_df_path):
                 clock_text = current_time.strftime('%Y-%m-%d %H:%M:%S')
                 day = current_time.weekday()
 
-        # draw control buttons and info
+        # Draw control buttons and info
         if simulation_running:
             button_color = (200, 100, 100)
             button_text = "Pause"
@@ -652,53 +735,60 @@ def animation_loop(awt,arrival_df_path):
         
         screen.blit(font.render(button_text, True, (255, 255, 255)), (WIDTH*0.75-5 , 515))
         screen.blit(font.render(status_text, True, (0, 0, 0)), (100, base_y + 20))
-        screen.blit(font.render(clock_text, True, (0, 0, 0)), (WIDTH*0.65-15, 50))
-        screen.blit(font.render(f"Day: {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][day]}", True, (0, 0, 0)), (WIDTH*0.65-15, 80))
-        screen.blit(font.render(f"Speed: ", True, (0, 0, 0)), (WIDTH*0.65-15, 110))
+        screen.blit(font.render(clock_text, True, (0, 0, 0)), (WIDTH*0.65-35, 50))
+        screen.blit(font.render(f"Day: {['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][day]}", True, (0, 0, 0)), (WIDTH*0.65-35, 80))
+        screen.blit(font.render(f"Speed: ", True, (0, 0, 0)), (WIDTH*0.65-35, 110))
         screen.blit(font.render(f"{sim_speed}x", True, (200, 100, 100)), (WIDTH*0.65+55, 110))
-        screen.blit(font.render(f"[1] 0.5x [2] 1x    [3] 5x", True, (0, 0, 0)), (WIDTH*0.65-15, 140))
-        screen.blit(font.render(f"[4] 10x  [5] 50x [6] 100x", True, (0, 0, 0)), (WIDTH*0.65-15, 170))
+        screen.blit(font.render(f"[1] 0.5x [2] 1x    [3] 5x", True, (0, 0, 0)), (WIDTH*0.65-35, 140))
+        screen.blit(font.render(f"[4] 10x  [5] 50x [6] 100x", True, (0, 0, 0)), (WIDTH*0.65-35, 170))
         
         # total completed passengers
         tcp = 0
-        if egcs_instance and egcs_instance.records:
-            tcp = len(egcs_instance.records)
-        screen.blit(font.render(f"Completed Passengers: {tcp}", True, (0, 0, 0)), (WIDTH*0.65-15, 230))
+        if egcs_instance and egcs_instance.passengers_records:
+            tcp = len(egcs_instance.passengers_records)
+        screen.blit(font.render(f"Completed Passengers: {tcp}", True, (0, 0, 0)), (WIDTH*0.65-35, 230))
         
         # average passenger per day
         apd = 0
-        if egcs_instance and egcs_instance.records and min_time:
+        if egcs_instance and egcs_instance.passengers_records and min_time:
             days_passed = (min_time + pd.Timedelta(seconds=env_instance.now) - min_time).days + 1
             apd = tcp / days_passed
-        screen.blit(font.render(f"Avg Passengers/Day: {apd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-15, 260))
+        screen.blit(font.render(f"Avg Passengers/Day: {apd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-35, 260))
         
         # baseline average waiting time
-        bawt = 15.19
-        screen.blit(font.render(f"Baseline AWT: {bawt:.2f}s", True, (0, 0, 0)), (WIDTH*0.65-15, 300))
+        bawt = awt
+        screen.blit(font.render(f"Baseline AWT: {bawt:.2f}s", True, (0, 0, 0)), (WIDTH*0.65-35, 300))
         
         
         # average waiting time
-        awt = 0
-        if egcs_instance and egcs_instance.records:
-            awt = egcs_instance.average_wait_time()
-        screen.blit(font.render(f"Current AWT: {awt:.2f}s", True, (0, 0, 0)), (WIDTH*0.65-15, 330))
+        current_awt = 0
+        if egcs_instance and egcs_instance.passengers_records:
+            current_awt = egcs_instance.average_wait_time()
+        screen.blit(font.render(f"Current AWT: {current_awt:.2f}s", True, (0, 0, 0)), (WIDTH*0.65-35, 330))
 
         
         # reposition count
         rc = 0
         if egcs_instance:
             rc = egcs_instance.reposition_count
-        screen.blit(font.render(f"Reposition Count: {rc}", True, (0, 0, 0)), (WIDTH*0.65-15, 370))
+        screen.blit(font.render(f"Reposition Count: {rc}", True, (0, 0, 0)), (WIDTH*0.65-35, 370))
         
         # reposition count per day
         rcpd = 0
         if egcs_instance and min_time:
             days_passed = (min_time + pd.Timedelta(seconds=env_instance.now) - min_time).days + 1
             rcpd = rc / days_passed
-        screen.blit(font.render(f"Reposition Count/Day: {rcpd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-15, 400))
+        screen.blit(font.render(f"Reposition Count/Day: {rcpd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-35, 400))
+        
+        # movement distance
+        rmd, tmd = 0,0
+        if egcs_instance:
+            rmd, tmd = egcs_instance.movement_count()
+        screen.blit(font.render(f"Reposition Movement: {rmd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-35, 440))
+        screen.blit(font.render(f"Total Movement: {tmd:.1f}", True, (0, 0, 0)), (WIDTH*0.65-35, 470))
 
 
-    # ==== 主循环 ====
+    # ==== Main Loop ====
     def main_loop(awt,arrival_df_path):
         global egcs_instance, env_instance, simulation_running, status_text, elevators, sim_speed
         env_instance, egcs_instance, min_timestamp, _ = setup_simulation(arrival_df_path, buffer_time=600)
@@ -720,7 +810,7 @@ def animation_loop(awt,arrival_df_path):
                         status_text = "Idle Repositioning ON" if egcs_instance.idle_reposition else "Idle Repositioning OFF"
                 
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_SPACE:  # 空格暂停/继续
+                    if event.key == pygame.K_SPACE:  # Space to pause/resume
                         simulation_running = not simulation_running
                         status_text = "Running..." if simulation_running else "Paused"
                     elif event.key == pygame.K_1: sim_speed = 0.5
@@ -752,14 +842,33 @@ def animation_loop(awt,arrival_df_path):
 
 if __name__ == "__main__":
     if mode == 'animation' :
-        awt = simulate_loop(arrival_df_path)
+        awt = 26.9439
         animation_loop(awt,arrival_df_path)
     elif mode == 'simulate' :
-        simulate_loop(arrival_df_path)
+        for profile in ['low_dense_low_rise', 'low_dense_high_rise', 'high_dense_low_rise', 'high_dense_high_rise']:
+            for reposition_mode in ['tsai','none', 'tcn' ]:                    
+                if reposition_mode.startswith('tcn'):
+                    for tcn_type in ['best_precision','best_recall','balance']:
+                        tcn_path = os.path.join(parent_dir, profile, 'best_model', f'{tcn_type}.pth')
+                        scaler_path = os.path.join(parent_dir, profile, 'scaler')
+                        if profile.endswith('low_rise'):
+                            num_floors = 10
+                        else:
+                            num_floors = 20
+                        print(f"Starting simulation for profile: {profile} with reposition mode: {reposition_mode}, tcn type: {tcn_type} and number of floors: {num_floors}")
+                        arrival_df_path = os.path.join(parent_dir, "new_arrival_simulator", "data", f"{profile}.csv")
+                        output_records_name = f"{profile}_reposition_{reposition_mode}_{tcn_type}.csv"
+                        simulate_loop(arrival_df_path, output_dir=output_dir,output_records_name=output_records_name)
+                else:
+                    if profile.endswith('low_rise'):
+                        num_floors = 10
+                    else:
+                        num_floors = 20
+                    print(f"Starting simulation for profile: {profile} with reposition mode: {reposition_mode} and number of floors: {num_floors}")
+                    arrival_df_path = os.path.join(parent_dir, "new_arrival_simulator", "data", f"{profile}.csv")
+                    output_records_name = f"{profile}_reposition_{reposition_mode}.csv"
+                    simulate_loop(arrival_df_path, output_dir=output_dir,output_records_name=output_records_name)
     elif mode == 'call_record' :    
         for file in ["low_dense_low_rise.csv", "low_dense_high_rise.csv", "high_dense_low_rise.csv", "high_dense_high_rise.csv"]:
             arrival_df_path = os.path.join(parent_dir, "new_arrival_simulator", "data", file)
-            simulate_loop(arrival_df_path)
-
-
-
+            simulate_loop(arrival_df_path, output_dir=output_dir,output_records_name=output_records_name)

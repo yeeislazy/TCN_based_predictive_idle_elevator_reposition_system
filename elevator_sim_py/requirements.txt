@@ -1,6 +1,0 @@
-simpy>=4.0.1
-pygame>=2.0.0  # optional, only for GUI
-
-# Pin setuptools to avoid pkg_resources deprecation warnings on some systems
-# (setuptools 81+ removes pkg_resources API that some packages still import).
-setuptools<81
